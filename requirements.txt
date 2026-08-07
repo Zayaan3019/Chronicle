@@ -1,0 +1,20 @@
+# Core dependencies
+chromadb>=0.5.3
+rank-bm25>=0.2.2
+sentence-transformers>=3.3.0
+requests>=2.32.0
+beautifulsoup4>=4.12.3
+streamlit>=1.40.0
+numpy>=1.26.0
+lxml>=5.3.0
+lxml-html-clean>=0.4.0          # required by trafilatura for HTML cleaning
+tqdm>=4.66.0
+trafilatura>=1.12.0
+scipy>=1.13.0            # Newey-West HAC significance test (Phase 4 event study)
+statsmodels>=0.14.2       # Newey-West HAC significance test (Phase 4 event study)
+
+# Streamlit currently requires protobuf < 6. The reranker is PyTorch-based, so
+# retrieval/hybrid.py explicitly disables TensorFlow imports before loading it.
+# Keep this compatible range; do not "fix" a TensorFlow ABI mismatch by upgrading
+# protobuf past Streamlit's upper bound in the shared runtime.
+protobuf>=5.29.0,<6

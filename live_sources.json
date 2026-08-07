@@ -1,0 +1,77 @@
+[
+  {
+    "id": "aapl-edgar",
+    "kind": "edgar",
+    "cik": "320193",
+    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000320193",
+    "title": "Apple Inc.",
+    "publisher": "SEC EDGAR",
+    "cluster": "Financial live sources",
+    "forms": ["10-K", "10-K/A", "10-Q", "10-Q/A", "8-K"],
+    "refresh_minutes": 240,
+    "max_items": 12,
+    "keywords": ["apple", "aapl"]
+  },
+  {
+    "id": "msft-edgar",
+    "kind": "edgar",
+    "cik": "789019",
+    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0000789019",
+    "title": "Microsoft Corporation",
+    "publisher": "SEC EDGAR",
+    "cluster": "Financial live sources",
+    "forms": ["10-K", "10-K/A", "10-Q", "10-Q/A", "8-K"],
+    "refresh_minutes": 240,
+    "max_items": 12,
+    "keywords": ["microsoft", "msft"]
+  },
+  {
+    "id": "nvda-edgar",
+    "kind": "edgar",
+    "cik": "1045810",
+    "url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001045810",
+    "title": "NVIDIA Corporation",
+    "publisher": "SEC EDGAR",
+    "cluster": "Financial live sources",
+    "forms": ["10-K", "10-K/A", "10-Q", "10-Q/A", "8-K"],
+    "refresh_minutes": 240,
+    "max_items": 12,
+    "keywords": ["nvidia", "nvda"]
+  },
+  {
+    "id": "aapl-news",
+    "kind": "gdelt",
+    "gdelt_query": "Apple Inc AAPL earnings OR guidance OR SEC filing",
+    "url": "https://www.gdeltproject.org/",
+    "title": "Apple — recent news context (GDELT)",
+    "publisher": "GDELT Project",
+    "cluster": "Financial live sources",
+    "refresh_minutes": 60,
+    "max_items": 10,
+    "keywords": ["apple", "aapl", "news"]
+  },
+  {
+    "id": "msft-news",
+    "kind": "gdelt",
+    "gdelt_query": "Microsoft MSFT earnings OR guidance OR SEC filing",
+    "url": "https://www.gdeltproject.org/",
+    "title": "Microsoft — recent news context (GDELT)",
+    "publisher": "GDELT Project",
+    "cluster": "Financial live sources",
+    "refresh_minutes": 60,
+    "max_items": 10,
+    "keywords": ["microsoft", "msft", "news"]
+  },
+  {
+    "id": "nvda-news",
+    "kind": "gdelt",
+    "gdelt_query": "NVIDIA NVDA earnings OR guidance OR SEC filing",
+    "url": "https://www.gdeltproject.org/",
+    "title": "NVIDIA — recent news context (GDELT)",
+    "publisher": "GDELT Project",
+    "cluster": "Financial live sources",
+    "refresh_minutes": 60,
+    "max_items": 10,
+    "keywords": ["nvidia", "nvda", "news"]
+  }
+]

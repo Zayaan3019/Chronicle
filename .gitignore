@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated indices and runtime state — rebuilt via `python indexer.py --force`
+# or the run_*.py scripts; never hand-edited, never committed.
+chroma_db/
+live_chroma_db/
+bm25_index.pkl
+data/*.sqlite3
+data/*.pkl
+data/eval_run/
+
+# Pre-Chronicle artifacts left over from the original healthcare_rag project —
+# not part of this codebase.
+articles_cache/
+index_done.flag
+final_eval_results.json
+Demo.mp4
+Together_assignment_writeup.pdf
+
+# Environment
+.env
