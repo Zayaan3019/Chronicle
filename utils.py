@@ -28,6 +28,31 @@ def _strip_think_blocks(text: str) -> str:
     return cleaned.strip()
 
 
+_GROQ_MAX_ATTEMPTS = 3  # Groq's free tier is shared per-org, not per-key -- a
+                        # 429 here is routine under real multi-agent traffic
+                        # (query_agent + reasoning_agent + critic_agent can
+                        # each call the same FAST_LLM within seconds of each
+                        # other), not exceptional; worth retrying, not failing fast.
+
+
+def _groq_retry_delay(resp: "requests.Response", attempt: int) -> float:
+    """
+    Seconds to wait before retrying a Groq 429. Verified empirically (2026-08-10)
+    that Groq sets a real Retry-After header on 429 responses -- prefer that
+    over a guessed backoff, since it reflects the server's own accounting of
+    when the token/request budget actually resets. +0.5s buffer for clock
+    skew; capped at 30s so a malformed or unexpectedly large header value
+    can't hang the app on what should be a short wait.
+    """
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return min(float(retry_after) + 0.5, 30.0)
+        except ValueError:
+            pass
+    return min(2.0 * (attempt + 1), 10.0)
+
+
 def _is_reasoning_model(model: str) -> bool:
     """
     Whether `model` accepts reasoning_effort="none" specifically (not just
@@ -173,7 +198,7 @@ def _call_groq(
     # num_ctx / num_thread (Ollama server-tuning knobs) have no Groq equivalent
     # and are intentionally dropped rather than mapped to something misleading.
 
-    for attempt in range(2):
+    for attempt in range(_GROQ_MAX_ATTEMPTS):
         try:
             resp = requests.post(
                 f"{config.GROQ_BASE_URL}/chat/completions",
@@ -181,23 +206,37 @@ def _call_groq(
                 json=payload,
                 timeout=300,
             )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            # Safety net: reasoning_effort="none" suppresses thinking on models
-            # that accept it, but strip defensively regardless (e.g. a plain
-            # model that emits think-like text unprompted, or a future Groq
-            # roster change) rather than assume it always will.
-            content = _strip_think_blocks(content)
-            return content
         except requests.exceptions.ConnectionError:
-            if attempt == 0:
+            if attempt < _GROQ_MAX_ATTEMPTS - 1:
                 time.sleep(2)
                 continue
             raise RuntimeError("Cannot reach Groq's API (network error).")
+
+        # Checked before raise_for_status() specifically so a 429 gets a
+        # retry-with-backoff instead of falling into the generic HTTPError
+        # handler below, which fails immediately -- verified this was the
+        # actual failure mode live: a real deploy hit "429 ... Rate limit
+        # reached ... tokens per minute" and surfaced it straight to the user
+        # with no retry at all.
+        if resp.status_code == 429:
+            if attempt < _GROQ_MAX_ATTEMPTS - 1:
+                time.sleep(_groq_retry_delay(resp, attempt))
+                continue
+            raise RuntimeError(
+                f"Groq rate limit exceeded after {_GROQ_MAX_ATTEMPTS} attempts: {resp.text[:500]}"
+            )
+
+        try:
+            resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
             raise RuntimeError(f"Groq API error: {e} — {resp.text[:500]}") from e
-        except Exception as e:
-            raise RuntimeError(f"LLM call failed: {e}") from e
+
+        content = resp.json()["choices"][0]["message"]["content"]
+        # Safety net: reasoning_effort="none" suppresses thinking on models
+        # that accept it, but strip defensively regardless (e.g. a plain
+        # model that emits think-like text unprompted, or a future Groq
+        # roster change) rather than assume it always will.
+        return _strip_think_blocks(content)
 
 
 def call_llm_stream(
@@ -276,15 +315,47 @@ def _call_groq_stream(messages, model, temperature, think):
     if not think and _is_reasoning_model(model):
         payload["reasoning_effort"] = "none"
 
+    # Retry-with-backoff on 429 happens BEFORE entering the streaming/yield
+    # phase -- safe to retry the whole request here since no chunks have been
+    # yielded yet, unlike a mid-stream failure which can't be transparently
+    # retried without the caller re-requesting. Same rate-limit reality as
+    # _call_groq: verified live that a real deploy's multi-agent traffic
+    # (query_agent + reasoning_agent + critic_agent sharing FAST_LLM) can
+    # exceed Groq's free-tier tokens-per-minute budget within seconds.
+    resp = None
+    for attempt in range(_GROQ_MAX_ATTEMPTS):
+        try:
+            resp = requests.post(
+                f"{config.GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+                json=payload,
+                stream=True,
+                timeout=600,
+            )
+        except requests.exceptions.ConnectionError:
+            if attempt < _GROQ_MAX_ATTEMPTS - 1:
+                time.sleep(2)
+                continue
+            raise RuntimeError("Cannot reach Groq's API (network error).")
+
+        if resp.status_code == 429:
+            if attempt < _GROQ_MAX_ATTEMPTS - 1:
+                delay = _groq_retry_delay(resp, attempt)
+                resp.close()
+                time.sleep(delay)
+                continue
+            raise RuntimeError(
+                f"Groq rate limit exceeded after {_GROQ_MAX_ATTEMPTS} attempts: {resp.text[:500]}"
+            )
+
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"Groq API error: {e} — {resp.text[:500]}") from e
+        break
+
     in_think = False
-    with requests.post(
-        f"{config.GROQ_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
-        json=payload,
-        stream=True,
-        timeout=600,
-    ) as resp:
-        resp.raise_for_status()
+    with resp:
         for line in resp.iter_lines():
             if not line:
                 continue
