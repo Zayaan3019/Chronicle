@@ -7,6 +7,25 @@ except ImportError:
     pass  # python-dotenv is optional locally; deployment targets (Streamlit
           # Community Cloud, etc.) inject real env vars directly.
 
+try:
+    # Streamlit Community Cloud's documented behavior is that root-level
+    # secrets.toml keys "will be available as an environment variable" --
+    # but the exact timing of that relative to this module's own import-time
+    # os.getenv() calls below is undocumented, and empirically it did not
+    # take effect on a real deploy (LLM_PROVIDER stayed at its "ollama"
+    # default despite being set to "groq" in the dashboard). Bridging
+    # st.secrets into os.environ explicitly here removes the dependency on
+    # that undocumented timing. setdefault so a real OS env var (local .env,
+    # AWS Lambda/EC2 env vars) always wins over a Streamlit secret, never the
+    # reverse. Broad except: st.secrets raises when no secrets.toml exists
+    # and there's no active Streamlit runtime context at all (pytest, other
+    # deployment targets where `streamlit` may not even be installed).
+    import streamlit as st
+    for _key, _value in st.secrets.items():
+        os.environ.setdefault(_key, str(_value))
+except Exception:
+    pass
+
 # ── LLM provider ──────────────────────────────────────────────────────
 # "ollama" (default): the original local-only path, unchanged.
 # "groq": hosted inference via Groq's free tier -- see utils.py's call_llm.
