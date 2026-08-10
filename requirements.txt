@@ -17,6 +17,10 @@ statsmodels>=0.14.2       # Newey-West HAC significance test (Phase 4 event stud
 python-dotenv>=1.0.1     # loads .env locally; deployment targets set real env vars directly
 psycopg[binary]>=3.2.0   # Postgres driver for memory.py / decision_log.py / live_data.py's Neon backend
 
+# Test suite (tests/, .github/workflows/tests.yml) -- was missing entirely
+# before this pass, which is why CI had never actually completed a run.
+pytest>=8.3.0
+
 # Streamlit currently requires protobuf < 6. The reranker is PyTorch-based, so
 # retrieval/hybrid.py explicitly disables TensorFlow imports before loading it.
 # Keep this compatible range; do not "fix" a TensorFlow ABI mismatch by upgrading
