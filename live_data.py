@@ -29,6 +29,7 @@ from bs4 import BeautifulSoup
 import requests
 
 import config
+import db_postgres
 import edgar_parse
 from edgar_client import EdgarClient
 from gdelt_client import GdeltClient
@@ -121,17 +122,24 @@ class LiveDataAgent:
         allow_insecure: bool | None = None,
         allow_private: bool | None = None,
         edgar_min_request_interval: float | None = None,
+        dsn: str | None = None,
     ) -> None:
         self.vector_store = vector_store
         self.bm25_store = bm25_store
-        self.state_path = Path(state_path or config.LIVE_STATE_DB_PATH)
         self.sources_path = Path(sources_path or config.LIVE_SOURCES_PATH)
         self.embedder = embedder
         self.http_get = http_get
         self.allow_insecure = config.ALLOW_INSECURE_LIVE_SOURCES if allow_insecure is None else allow_insecure
         self.allow_private = config.ALLOW_PRIVATE_LIVE_SOURCES if allow_private is None else allow_private
         self._edgar_min_request_interval = edgar_min_request_interval
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        # Same rule as memory.py/decision_log.py: an explicit state_path (every
+        # existing test passes one) always forces SQLite; Postgres is used only
+        # when a DSN is available and nothing forced a specific sqlite file.
+        self.dsn = dsn or (db_postgres.dsn() if state_path is None else None)
+        self.backend = "postgres" if self.dsn else "sqlite"
+        if self.backend == "sqlite":
+            self.state_path = Path(state_path or config.LIVE_STATE_DB_PATH)
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialise()
         self._edgar_client: EdgarClient | None = None
         self._gdelt_client: GdeltClient | None = None
@@ -153,6 +161,9 @@ class LiveDataAgent:
         return conn
 
     def _initialise(self) -> None:
+        if self.backend == "postgres":
+            self._pg_initialise()
+            return
         with closing(self._connect()) as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(
@@ -180,6 +191,31 @@ class LiveDataAgent:
                 )
                 """
             )
+
+    def _pg_initialise(self) -> None:
+        with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_source_state (
+                    source_id TEXT PRIMARY KEY,
+                    etag TEXT, last_modified TEXT, last_checked TEXT NOT NULL,
+                    last_success TEXT, last_error TEXT,
+                    lease_owner TEXT, lease_until TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS live_documents (
+                    source_id TEXT NOT NULL, item_key TEXT NOT NULL,
+                    article_id TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
+                    published TEXT NOT NULL, content_hash TEXT NOT NULL,
+                    chunk_ids_json TEXT NOT NULL, ingested_at TEXT NOT NULL,
+                    PRIMARY KEY(source_id, item_key)
+                )
+                """
+            )
+            conn.commit()
 
     @staticmethod
     def load_sources(path: str | Path) -> list[LiveSource]:
@@ -231,7 +267,28 @@ class LiveDataAgent:
             )
         return sources
 
+    def _lookup_live_document(self, source_id: str, item_key: str) -> dict | None:
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM live_documents WHERE source_id = %s AND item_key = %s",
+                    (source_id, item_key),
+                )
+                row = cur.fetchone()
+            return dict(row) if row else None
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT * FROM live_documents WHERE source_id = ? AND item_key = ?",
+                (source_id, item_key),
+            ).fetchone()
+        return dict(row) if row else None
+
     def _state(self, source_id: str) -> dict[str, str]:
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute("SELECT * FROM live_source_state WHERE source_id = %s", (source_id,))
+                row = cur.fetchone()
+            return dict(row) if row else {}
         with closing(self._connect()) as conn:
             row = conn.execute("SELECT * FROM live_source_state WHERE source_id = ?", (source_id,)).fetchone()
         return dict(row) if row else {}
@@ -255,6 +312,8 @@ class LiveDataAgent:
 
     def _acquire_lease(self, source_id: str) -> str | None:
         """Acquire a short cross-process lease before a network/index mutation."""
+        if self.backend == "postgres":
+            return self._pg_acquire_lease(source_id)
         owner = uuid.uuid4().hex
         now = datetime.now(UTC)
         expires = (now + timedelta(minutes=max(2, config.REQUEST_TIMEOUT // 15))).isoformat()
@@ -283,7 +342,50 @@ class LiveDataAgent:
             conn.execute("COMMIT")
         return None
 
+    def _pg_acquire_lease(self, source_id: str) -> str | None:
+        """Postgres version of the lease above, but as one atomic statement
+        instead of SQLite's explicit BEGIN IMMEDIATE + read-then-write: the
+        WHERE clause on DO UPDATE is re-checked against the row's current
+        state under Postgres's own row lock, so two concurrent callers can't
+        both observe "available" before either writes -- the same guarantee
+        BEGIN IMMEDIATE gave, with no separate transaction-control statements
+        needed. Comparing lease_until as ::timestamptz (not raw TEXT) avoids
+        a lexicographic-comparison bug: Python's isoformat() omits
+        microseconds when they're exactly zero, producing variable-length
+        strings that would sort incorrectly as plain text.
+        """
+        owner = uuid.uuid4().hex
+        now = datetime.now(UTC)
+        expires = now + timedelta(minutes=max(2, config.REQUEST_TIMEOUT // 15))
+        with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO live_source_state(source_id, last_checked, lease_owner, lease_until)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (source_id) DO UPDATE SET
+                    last_checked = EXCLUDED.last_checked,
+                    lease_owner  = EXCLUDED.lease_owner,
+                    lease_until  = EXCLUDED.lease_until
+                WHERE live_source_state.lease_until IS NULL
+                   OR live_source_state.lease_until::timestamptz <= %s::timestamptz
+                RETURNING lease_owner
+                """,
+                (source_id, now.isoformat(), owner, expires.isoformat(), now.isoformat()),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return owner if row else None
+
     def _release_lease(self, source_id: str, owner: str) -> None:
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE live_source_state SET lease_owner = NULL, lease_until = NULL "
+                    "WHERE source_id = %s AND lease_owner = %s",
+                    (source_id, owner),
+                )
+                conn.commit()
+            return
         with closing(self._connect()) as conn:
             conn.execute(
                 "UPDATE live_source_state SET lease_owner = NULL, lease_until = NULL "
@@ -549,6 +651,22 @@ class LiveDataAgent:
 
     def _write_state(self, source: LiveSource, headers: dict[str, str], error: str = "") -> None:
         now = _utcnow()
+        values = (source.id, headers.get("etag", ""), headers.get("last_modified", ""), now, None if error else now, error or None)
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO live_source_state(source_id, etag, last_modified, last_checked, last_success, last_error)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (source_id) DO UPDATE SET etag=EXCLUDED.etag, last_modified=EXCLUDED.last_modified,
+                        last_checked=EXCLUDED.last_checked,
+                        last_success=CASE WHEN EXCLUDED.last_success IS NULL THEN live_source_state.last_success ELSE EXCLUDED.last_success END,
+                        last_error=EXCLUDED.last_error
+                    """,
+                    values,
+                )
+                conn.commit()
+            return
         with closing(self._connect()) as conn:
             conn.execute(
                 """
@@ -559,7 +677,7 @@ class LiveDataAgent:
                     last_success=CASE WHEN excluded.last_success IS NULL THEN live_source_state.last_success ELSE excluded.last_success END,
                     last_error=excluded.last_error
                 """,
-                (source.id, headers.get("etag", ""), headers.get("last_modified", ""), now, None if error else now, error or None),
+                values,
             )
 
     def refresh_source(self, source: LiveSource, force: bool = False) -> RefreshReport:
@@ -594,28 +712,24 @@ class LiveDataAgent:
             changed: list[tuple[dict, str, list[str], list[ChunkResult]]] = []
             additions = 0
             replacements = 0
-            with closing(self._connect()) as conn:
-                for document in documents:
-                    # Version includes provenance-template fields, so a code/config
-                    # change affecting retrieval representation safely reindexes old
-                    # live documents instead of treating them as unchanged forever.
-                    digest = _content_hash(
-                        f"{source.title}|{source.publisher}|{source.cluster}|{document['text']}"
-                    )
-                    row = conn.execute(
-                        "SELECT * FROM live_documents WHERE source_id = ? AND item_key = ?",
-                        (source.id, document["item_key"]),
-                    ).fetchone()
-                    if row and row["content_hash"] == digest:
-                        continue
-                    article_id = row["article_id"] if row else self._article_id(source.id, document["item_key"])
-                    old_chunk_ids = json.loads(row["chunk_ids_json"]) if row else []
-                    chunks = self._make_chunks(source, document, article_id, digest)
-                    if not chunks:
-                        continue
-                    changed.append((document, article_id, old_chunk_ids, chunks))
-                    additions += 0 if row else 1
-                    replacements += 1 if row else 0
+            for document in documents:
+                # Version includes provenance-template fields, so a code/config
+                # change affecting retrieval representation safely reindexes old
+                # live documents instead of treating them as unchanged forever.
+                digest = _content_hash(
+                    f"{source.title}|{source.publisher}|{source.cluster}|{document['text']}"
+                )
+                row = self._lookup_live_document(source.id, document["item_key"])
+                if row and row["content_hash"] == digest:
+                    continue
+                article_id = row["article_id"] if row else self._article_id(source.id, document["item_key"])
+                old_chunk_ids = json.loads(row["chunk_ids_json"]) if row else []
+                chunks = self._make_chunks(source, document, article_id, digest)
+                if not chunks:
+                    continue
+                changed.append((document, article_id, old_chunk_ids, chunks))
+                additions += 0 if row else 1
+                replacements += 1 if row else 0
             if not changed:
                 self._write_state(source, headers)
                 return RefreshReport(source.id, "unchanged", message="Content hash unchanged")
@@ -631,21 +745,40 @@ class LiveDataAgent:
                 list({article_id for _, article_id, old, _ in changed if old}), new_chunks
             )
             now = _utcnow()
-            with closing(self._connect()) as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                for document, article_id, _, chunks in changed:
-                    conn.execute(
-                        """
-                        INSERT INTO live_documents(source_id, item_key, article_id, title, url, published, content_hash, chunk_ids_json, ingested_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(source_id, item_key) DO UPDATE SET title=excluded.title, url=excluded.url,
-                            published=excluded.published, content_hash=excluded.content_hash,
-                            chunk_ids_json=excluded.chunk_ids_json, ingested_at=excluded.ingested_at
-                        """,
-                        (source.id, document["item_key"], article_id, document["title"], document["url"], document["published"],
-                         _content_hash(f"{source.title}|{source.publisher}|{source.cluster}|{document['text']}"), json.dumps([c.chunk_id for c in chunks]), now),
-                    )
-                conn.execute("COMMIT")
+            doc_rows = [
+                (source.id, document["item_key"], article_id, document["title"], document["url"], document["published"],
+                 _content_hash(f"{source.title}|{source.publisher}|{source.cluster}|{document['text']}"), json.dumps([c.chunk_id for c in chunks]), now)
+                for document, article_id, _, chunks in changed
+            ]
+            if self.backend == "postgres":
+                with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                    for row in doc_rows:
+                        cur.execute(
+                            """
+                            INSERT INTO live_documents(source_id, item_key, article_id, title, url, published, content_hash, chunk_ids_json, ingested_at)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (source_id, item_key) DO UPDATE SET title=EXCLUDED.title, url=EXCLUDED.url,
+                                published=EXCLUDED.published, content_hash=EXCLUDED.content_hash,
+                                chunk_ids_json=EXCLUDED.chunk_ids_json, ingested_at=EXCLUDED.ingested_at
+                            """,
+                            row,
+                        )
+                    conn.commit()
+            else:
+                with closing(self._connect()) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for row in doc_rows:
+                        conn.execute(
+                            """
+                            INSERT INTO live_documents(source_id, item_key, article_id, title, url, published, content_hash, chunk_ids_json, ingested_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(source_id, item_key) DO UPDATE SET title=excluded.title, url=excluded.url,
+                                published=excluded.published, content_hash=excluded.content_hash,
+                                chunk_ids_json=excluded.chunk_ids_json, ingested_at=excluded.ingested_at
+                            """,
+                            row,
+                        )
+                    conn.execute("COMMIT")
             self._write_state(source, headers)
             return RefreshReport(source.id, "updated", additions, replacements, f"Indexed {len(new_chunks)} chunks")
         except Exception as exc:

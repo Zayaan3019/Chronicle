@@ -13,6 +13,10 @@ trafilatura>=1.12.0
 scipy>=1.13.0            # Newey-West HAC significance test (Phase 4 event study)
 statsmodels>=0.14.2       # Newey-West HAC significance test (Phase 4 event study)
 
+# Cloud deployment (LLM_PROVIDER=groq path; Neon Postgres state backend)
+python-dotenv>=1.0.1     # loads .env locally; deployment targets set real env vars directly
+psycopg[binary]>=3.2.0   # Postgres driver for memory.py / decision_log.py / live_data.py's Neon backend
+
 # Streamlit currently requires protobuf < 6. The reranker is PyTorch-based, so
 # retrieval/hybrid.py explicitly disables TensorFlow imports before loading it.
 # Keep this compatible range; do not "fix" a TensorFlow ABI mismatch by upgrading

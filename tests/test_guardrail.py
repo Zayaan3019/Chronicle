@@ -24,8 +24,14 @@ FUTURE = "2027-01-01T00:00:00.000Z"
 def _isolated_decision_log(tmp_path, monkeypatch):
     """Every guardrail.evaluate() call in this file writes a decision-log row
     by design (guardrail.py:evaluate) — redirect it to a throwaway file so
-    running these tests never leaves sqlite artifacts in the real data/ dir."""
+    running these tests never leaves sqlite artifacts in the real data/ dir.
+    Also force the SQLite path explicitly: decision_log.record()/read_all()
+    auto-detect NEON_DATABASE_URL when no db_path is given (see decision_log.py),
+    same as memory.py/live_data.py — without clearing it here, a developer
+    machine or CI runner with that env var set would have these tests silently
+    write to the real Neon database instead of the isolated tmp_path file."""
     monkeypatch.setattr(config, "GUARDRAIL_DECISION_LOG_PATH", str(tmp_path / "decisions.sqlite3"))
+    monkeypatch.setattr(config, "NEON_DATABASE_URL", "")
 
 
 def _chunk(chunk_id: str, text: str, filed_at: str = PAST) -> ChunkResult:

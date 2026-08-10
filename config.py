@@ -1,17 +1,53 @@
 import os
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv is optional locally; deployment targets (Streamlit
+          # Community Cloud, etc.) inject real env vars directly.
+
+# ── LLM provider ──────────────────────────────────────────────────────
+# "ollama" (default): the original local-only path, unchanged.
+# "groq": hosted inference via Groq's free tier -- see utils.py's call_llm.
+# Ollama-only tuning knobs (NUM_CTX, NUM_THREADS, num_ctx per-call overrides)
+# have no Groq equivalent and are silently ignored on that path rather than
+# left to imply a control that no longer does anything.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
+
 # ── Ollama ─────────────────────────────────────────────────────────────
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
-# Primary reasoning model — qwen3:8b for Agent 2 (Reasoner).
-# qwen3:8b is a newer generation Qwen model with built-in thinking mode; its CoT output
-# significantly improves factual accuracy and citation quality for complex synthesis tasks.
-MAIN_LLM  = os.getenv("MAIN_LLM",  "qwen3:8b")
-# Fast model for structured JSON tasks (Agent 1 decomposer, Agent 3 critic).
-# qwen2.5:3b is fast, reliable for JSON output, and sufficient for routing/verification.
-# Ollama's format=json automatically disables qwen3 thinking mode for JSON calls too.
-FAST_LLM  = os.getenv("FAST_LLM",  "qwen2.5:3b")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
+# ── Groq (used when LLM_PROVIDER=groq) ──────────────────────────────────
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+
+if LLM_PROVIDER == "groq":
+    # Verified live against Groq's /v1/models on 2026-08-10. Groq's free-tier
+    # roster rotates -- if a model here 404s, check console.groq.com/docs/models
+    # and update the default (or override via env var without a code change).
+    _DEFAULT_MAIN_LLM = "qwen/qwen3.6-27b"    # reasoning agent; same family as the qwen3:8b this replaces
+    _DEFAULT_FAST_LLM = "llama-3.1-8b-instant"  # decomposer/critic; Groq's own low-latency model
+else:
+    # Primary reasoning model — qwen3:8b for Agent 2 (Reasoner).
+    # qwen3:8b is a newer generation Qwen model with built-in thinking mode; its CoT output
+    # significantly improves factual accuracy and citation quality for complex synthesis tasks.
+    _DEFAULT_MAIN_LLM = "qwen3:8b"
+    # Fast model for structured JSON tasks (Agent 1 decomposer, Agent 3 critic).
+    # qwen2.5:3b is fast, reliable for JSON output, and sufficient for routing/verification.
+    # Ollama's format=json automatically disables qwen3 thinking mode for JSON calls too.
+    _DEFAULT_FAST_LLM = "qwen2.5:3b"
+
+MAIN_LLM = os.getenv("MAIN_LLM", _DEFAULT_MAIN_LLM)
+FAST_LLM = os.getenv("FAST_LLM", _DEFAULT_FAST_LLM)
+
+# ── Embeddings ────────────────────────────────────────────────────────
+# Always local via sentence-transformers, regardless of LLM_PROVIDER -- avoids
+# a second external API dependency, and sentence-transformers is already a
+# pinned requirement (it backs the cross-encoder reranker in retrieval/hybrid.py).
+# Switching this value changes the vector space: live_chroma_db/ must be fully
+# rebuilt (see README's reindex runbook), never partially/incrementally.
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 
 # ── Chunking ───────────────────────────────────────────────────────────
 CHUNK_SIZE    = 420   # approximate words per chunk
@@ -103,6 +139,13 @@ NUM_CTX = 6144
 # Intel Core Ultra 7 155H: 16 cores - 12 is optimal (avoids hyperthreading overhead).
 NUM_THREADS = 12
 MAX_HISTORY_TURNS = 3   # 3 turns covers 95 % of conversations; saves ~200 ms/query
+
+# ── Postgres (Neon) ──────────────────────────────────────────────────────
+# Opt-in durable-state backend for memory.py / decision_log.py / live_data.py
+# -- used automatically when set AND the caller doesn't force a specific
+# sqlite path (see each module's docstring). Empty string means "use SQLite",
+# matching every existing test's explicit sqlite path construction.
+NEON_DATABASE_URL = os.getenv("NEON_DATABASE_URL", "")
 
 # ── Live / dynamic data ────────────────────────────────────────────────────
 # Dynamic documents are incrementally upserted and retain their own provenance.

@@ -1,6 +1,7 @@
 """
-Shared utilities: LLM calls (via Ollama REST API), embeddings, robust JSON parsing.
-Uses direct HTTP calls to avoid Python library version conflicts.
+Shared utilities: LLM calls (via Ollama or Groq, config.LLM_PROVIDER-selected),
+local embeddings (sentence-transformers), robust JSON parsing.
+LLM calls use direct HTTP calls to avoid Python library version conflicts.
 """
 
 import json
@@ -25,6 +26,19 @@ def _strip_think_blocks(text: str) -> str:
     # Remove full <think>...</think> blocks (possibly multiline)
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     return cleaned.strip()
+
+
+def _is_reasoning_model(model: str) -> bool:
+    """
+    Whether `model` accepts reasoning_effort="none" specifically (not just
+    "accepts the reasoning_effort parameter at all" -- verified empirically
+    2026-08-10 that gpt-oss models DO accept the parameter but reject "none",
+    only "low"/"medium"/"high", a different contract from qwen3's. Only
+    qwen3-family models are confirmed to accept "none"; extend this by
+    testing each new model added, not by assuming a shared contract across
+    Groq's reasoning models -- see console.groq.com/docs/models.
+    """
+    return "qwen3" in model.lower()
 
 
 def _ollama_options(temperature: float, num_ctx: int | None = None) -> dict:
@@ -55,9 +69,27 @@ def call_llm(
     think: bool = False,
 ) -> str:
     """
-    Call Ollama chat endpoint. Returns the assistant message content as a string.
-    Retries once on connection error.
-    Strips qwen3 <think> blocks from free-text (non-JSON) responses automatically.
+    Call the configured LLM provider's chat endpoint (config.LLM_PROVIDER).
+    Returns the assistant message content as a string. Strips <think> blocks
+    from free-text (non-JSON) responses automatically -- both Ollama's local
+    qwen3 and Groq's hosted qwen3.6 emit these the same way.
+    """
+    model = model or config.MAIN_LLM
+    if config.LLM_PROVIDER == "groq":
+        return _call_groq(messages, model, temperature, json_mode, think)
+    return _call_ollama(messages, model, temperature, json_mode, num_ctx, think)
+
+
+def _call_ollama(
+    messages: list[dict],
+    model: str,
+    temperature: float,
+    json_mode: bool,
+    num_ctx: int | None,
+    think: bool,
+) -> str:
+    """
+    Call Ollama chat endpoint. Retries once on connection error.
 
     think=False (default): passes "think": false to Ollama for qwen3 models.
     This suppresses internal <think>...</think> token generation entirely, saving
@@ -65,7 +97,6 @@ def call_llm(
     pure latency savings with no accuracy loss.  json_mode calls are unaffected
     (Ollama already suppresses thinking when format=json).
     """
-    model = model or config.MAIN_LLM
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -104,6 +135,71 @@ def call_llm(
             raise RuntimeError(f"LLM call failed: {e}") from e
 
 
+def _call_groq(
+    messages: list[dict],
+    model: str,
+    temperature: float,
+    json_mode: bool,
+    think: bool,
+) -> str:
+    """
+    Call Groq's OpenAI-compatible chat completions endpoint.
+
+    Verified live (2026-08-10) against qwen/qwen3.6-27b: it emits inline
+    <think>...</think> blocks exactly like local Ollama qwen3 UNLESS
+    reasoning_effort="none" is passed, which suppresses them at the API level
+    (Groq's equivalent of Ollama's think=false) -- confirmed empirically, this
+    also works cleanly together with response_format=json_object to return
+    directly-parseable JSON with no thinking preamble at all.
+    """
+    if not config.GROQ_API_KEY:
+        raise RuntimeError(
+            "LLM_PROVIDER=groq but GROQ_API_KEY is not set. "
+            "Get a free key at https://console.groq.com/keys"
+        )
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    # reasoning_effort is only accepted by reasoning-capable models -- verified
+    # empirically that Groq 400s ("reasoning_effort is not supported with this
+    # model") when sent to a plain model like llama-3.1-8b-instant (FAST_LLM).
+    # Same guard shape as the Ollama path's `"think": False` gate below it.
+    if not think and _is_reasoning_model(model):
+        payload["reasoning_effort"] = "none"
+    # num_ctx / num_thread (Ollama server-tuning knobs) have no Groq equivalent
+    # and are intentionally dropped rather than mapped to something misleading.
+
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                f"{config.GROQ_BASE_URL}/chat/completions",
+                headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+                json=payload,
+                timeout=300,
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            # Safety net: reasoning_effort="none" suppresses thinking on models
+            # that accept it, but strip defensively regardless (e.g. a plain
+            # model that emits think-like text unprompted, or a future Groq
+            # roster change) rather than assume it always will.
+            content = _strip_think_blocks(content)
+            return content
+        except requests.exceptions.ConnectionError:
+            if attempt == 0:
+                time.sleep(2)
+                continue
+            raise RuntimeError("Cannot reach Groq's API (network error).")
+        except requests.exceptions.HTTPError as e:
+            raise RuntimeError(f"Groq API error: {e} — {resp.text[:500]}") from e
+        except Exception as e:
+            raise RuntimeError(f"LLM call failed: {e}") from e
+
+
 def call_llm_stream(
     messages: list[dict],
     model: str = None,
@@ -111,15 +207,22 @@ def call_llm_stream(
     num_ctx: int | None = None,
     think: bool = False,
 ):
-    """
-    Generator that yields text chunks from a streaming Ollama chat response.
-    Useful for Streamlit progressive display.
+    """Generator yielding text chunks from a streaming chat response, from
+    whichever provider config.LLM_PROVIDER selects. Useful for Streamlit
+    progressive display."""
+    model = model or config.MAIN_LLM
+    if config.LLM_PROVIDER == "groq":
+        yield from _call_groq_stream(messages, model, temperature, think)
+    else:
+        yield from _call_ollama_stream(messages, model, temperature, num_ctx, think)
 
+
+def _call_ollama_stream(messages, model, temperature, num_ctx, think):
+    """
     think=False (default): disables qwen3 internal <think> token generation at
     the model level (Ollama ≥ 0.6.4), so no tokens need to be filtered out.
     The in_think state-machine below is kept as a safety net for older Ollama.
     """
-    model = model or config.MAIN_LLM
     payload = {
         "model": model,
         "messages": messages,
@@ -155,62 +258,97 @@ def call_llm_stream(
                     yield chunk
 
 
-# ── Embeddings ────────────────────────────────────────────────────────────────
+def _call_groq_stream(messages, model, temperature, think):
+    """Groq streams OpenAI-style SSE (`data: {...}` lines, `data: [DONE]`
+    sentinel) rather than Ollama's raw NDJSON -- the parsing differs even
+    though the <think>-stripping state machine below is identical."""
+    if not config.GROQ_API_KEY:
+        raise RuntimeError(
+            "LLM_PROVIDER=groq but GROQ_API_KEY is not set. "
+            "Get a free key at https://console.groq.com/keys"
+        )
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+    if not think and _is_reasoning_model(model):
+        payload["reasoning_effort"] = "none"
 
-_EMBED_MAX_CHARS = 5000   # nomic-embed-text default context ≈ 2048 tokens; 5000 chars is safe
+    in_think = False
+    with requests.post(
+        f"{config.GROQ_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+        json=payload,
+        stream=True,
+        timeout=600,
+    ) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line = line.decode("utf-8") if isinstance(line, bytes) else line
+            if not line.startswith("data: "):
+                continue
+            data_str = line[len("data: "):]
+            if data_str.strip() == "[DONE]":
+                break
+            data = json.loads(data_str)
+            delta = data["choices"][0]["delta"]
+            chunk = delta.get("content")
+            if not chunk:
+                continue
+            if "<think>" in chunk:
+                in_think = True
+            if in_think:
+                if "</think>" in chunk:
+                    in_think = False
+                    after = chunk.split("</think>", 1)[1]
+                    if after:
+                        yield after
+                continue
+            yield chunk
+
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+# Local via sentence-transformers regardless of LLM_PROVIDER (see config.py) --
+# avoids a second external API dependency and keeps embedding cost at $0
+# regardless of traffic. Same public signatures as the old Ollama-backed
+# versions (str -> list[float], list[str] -> list[list[float]]), so every
+# caller (retrieval/hybrid.py, live_data.py, indexer.py) is unchanged.
+
+_EMBED_MAX_CHARS = 5000  # matches the old Ollama-path truncation; bge-small's
+                          # 512-token context is comparably sized in practice.
+
+_embed_model = None  # lazy-loaded singleton -- imported at call time, not
+                      # module import time, so importing utils.py doesn't
+                      # force a model download/load for callers that never embed.
+
+
+def _get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        from sentence_transformers import SentenceTransformer
+        _embed_model = SentenceTransformer(config.EMBED_MODEL)
+    return _embed_model
 
 
 def embed_text(text: str) -> list[float]:
-    """
-    Return a float embedding vector for a single text string.
-    Truncates to _EMBED_MAX_CHARS to stay within the model's context window
-    (long URL fragments in scraped text can otherwise exceed token limits).
-    """
+    """Return a float embedding vector for a single text string."""
     if len(text) > _EMBED_MAX_CHARS:
         text = text[:_EMBED_MAX_CHARS]
-    resp = requests.post(
-        f"{config.OLLAMA_BASE_URL}/api/embed",
-        json={"model": config.EMBED_MODEL, "input": text},
-        timeout=120,   # 120s: Ollama may queue embed behind an in-flight LLM call
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    # Ollama returns {"embeddings": [[...]]} for /api/embed
-    embeddings = data.get("embeddings") or data.get("embedding")
-    if isinstance(embeddings[0], list):
-        return embeddings[0]
-    return embeddings
+    vec = _get_embed_model().encode(text, convert_to_numpy=True, normalize_embeddings=True)
+    return vec.tolist()
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
-    """
-    Embed multiple texts. Tries a single batch Ollama call first (fast path).
-    Falls back to individual embed_text calls if the batch API returns an error
-    or an unexpected response (handles older Ollama versions that reject list input).
-    """
+    """Embed multiple texts in one batched forward pass (CPU-friendly at this model size)."""
     if not texts:
         return []
-
-    # Fast path: batch call
-    try:
-        resp = requests.post(
-            f"{config.OLLAMA_BASE_URL}/api/embed",
-            json={"model": config.EMBED_MODEL, "input": texts},
-            timeout=120,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            embeddings = data.get("embeddings") or data.get("embedding")
-            if embeddings:
-                if not isinstance(embeddings[0], list):
-                    embeddings = [embeddings]
-                if len(embeddings) == len(texts):
-                    return embeddings
-    except Exception:
-        pass
-
-    # Slow-path fallback: one call per text (reliable on all Ollama versions)
-    return [embed_text(t) for t in texts]
+    truncated = [t[:_EMBED_MAX_CHARS] if len(t) > _EMBED_MAX_CHARS else t for t in texts]
+    vecs = _get_embed_model().encode(truncated, convert_to_numpy=True, normalize_embeddings=True)
+    return vecs.tolist()
 
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────
@@ -251,7 +389,13 @@ def extract_json(text: str) -> dict:
 # ── Connectivity check ────────────────────────────────────────────────────────
 
 def check_ollama() -> tuple[bool, str]:
-    """Return (ok, message) checking Ollama is reachable and required models exist."""
+    """
+    Return (ok, message) checking the configured LLM provider is reachable.
+    Named check_ollama for backward compatibility with existing callers
+    (app.py); dispatches to Groq's check when LLM_PROVIDER=groq.
+    """
+    if config.LLM_PROVIDER == "groq":
+        return _check_groq()
     try:
         resp = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5)
         resp.raise_for_status()
@@ -272,6 +416,25 @@ def check_ollama() -> tuple[bool, str]:
         return True, "Ollama OK"
     except Exception as e:
         return False, f"Ollama not reachable: {e}. Start with: ollama serve"
+
+
+def _check_groq() -> tuple[bool, str]:
+    if not config.GROQ_API_KEY:
+        return False, "GROQ_API_KEY not set. Get a free key at https://console.groq.com/keys"
+    try:
+        resp = requests.get(
+            f"{config.GROQ_BASE_URL}/models",
+            headers={"Authorization": f"Bearer {config.GROQ_API_KEY}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        available = {m["id"] for m in resp.json().get("data", [])}
+        missing = [m for m in (config.MAIN_LLM, config.FAST_LLM) if m not in available]
+        if missing:
+            return False, f"Configured model(s) not on Groq's current roster: {missing}. See console.groq.com/docs/models"
+        return True, "Groq OK"
+    except Exception as e:
+        return False, f"Groq not reachable: {e}"
 
 
 # ── Text utilities ────────────────────────────────────────────────────────────

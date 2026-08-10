@@ -29,6 +29,27 @@ def pipeline():
     return st.session_state.pipeline
 
 
+@st.cache_resource(show_spinner=False)
+def _ensure_index_populated() -> list[str]:
+    """Self-healing cold start: on a fresh container, live_chroma_db/ is
+    empty (it's local disk, not part of the Neon Postgres migration -- see
+    DEPLOYMENT.md's "Known limitation" section for why), so the first
+    visitor after any redeploy would otherwise get zero retrieval results
+    with no indication why. @st.cache_resource runs this exactly once per
+    running process, shared across every session that hits this container
+    (not once per user) -- the second and subsequent visitors pay nothing.
+    Returns human-readable report lines for the sidebar; empty list if the
+    index was already populated (nothing to do).
+    """
+    from indexer import get_index_stats
+    from pipeline import ChroniclePipeline
+
+    if get_index_stats()["vector_chunks"] > 0:
+        return []
+    reports = ChroniclePipeline().run_live_data_agent("latest SEC filings and financial news", force=True)
+    return [f"{r.source_id}: {r.status} — {r.message}" for r in reports]
+
+
 def source_label(chunk) -> str:
     return chunk.citation_label if hasattr(chunk, "citation_label") else chunk.get("citation_label", "Source")
 
@@ -68,8 +89,15 @@ def serialise_chunks(chunks) -> list[dict]:
     ]
 
 
+with st.spinner("First run on this container: populating the retrieval index from live sources…"):
+    _cold_start_reports = _ensure_index_populated()
+
 with st.sidebar:
     st.header("Live source operations")
+    if _cold_start_reports:
+        with st.expander("Cold-start index population (ran once for this container)", expanded=False):
+            for line in _cold_start_reports:
+                st.caption(line)
     configured_sources = LiveDataAgent.load_sources(config.LIVE_SOURCES_PATH)
     if configured_sources:
         for source in configured_sources:
@@ -78,7 +106,7 @@ with st.sidebar:
         st.warning("No live sources configured. Add trusted sources to live_sources.json.")
 
     ok, status = check_ollama()
-    st.caption(f"Ollama: {'ready' if ok else status}")
+    st.caption(f"LLM ({config.LLM_PROVIDER}): {'ready' if ok else status}")
     if st.button("Refresh all sources", use_container_width=True):
         reports = pipeline().run_live_data_agent("latest SEC filings and financial news", force=True)
         for report in reports:

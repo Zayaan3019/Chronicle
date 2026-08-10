@@ -18,5 +18,11 @@ jobs:
           pip install -r requirements.txt
       # Includes the Phase 3B guardrail adversarial fixture suite
       # (tests/test_guardrail.py) — a non-zero exit here is a regression gate.
+      # GROQ_API_KEY (repo secret, set once the LLM_PROVIDER=groq deployment
+      # exists) additionally enables tests/test_groq_integration.py's live
+      # checks against the real deployed LLM path; every other test here
+      # stays fully offline and runs identically with or without the secret.
       - name: Run test suite
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python -m pytest -q

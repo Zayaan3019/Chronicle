@@ -3,9 +3,17 @@
 This module intentionally stores conversation turns rather than extracting hidden
 facts about the user with an LLM.  That makes memory auditable, prevents accidental
 construction of a persistent profile beyond the conversation itself, and lets
-callers delete an entire session exactly. SQLite/WAL is appropriate for a
-single-node Streamlit or API deployment; move the same interface behind a
-managed encrypted database for a multi-node deployment.
+callers delete an entire session exactly.
+
+Two backends behind the same interface, selected the same way config.py
+selects LLM_PROVIDER: SQLite/WAL (default -- appropriate for a single-node
+deployment with persistent disk, and what every existing test constructs
+explicitly via `path=`) or Postgres (used automatically when NEON_DATABASE_URL
+is set and the caller did not force a specific sqlite path -- for deployment
+targets whose local disk does not survive every redeploy). SQLite's FTS5
+becomes Postgres's built-in `tsvector`/`to_tsquery` full-text search; the
+`relevant()` query semantics (OR across regex-tokenised terms, ranked) are
+preserved, not just approximated.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from pathlib import Path
 from typing import Iterable
 
 import config
+import db_postgres
 
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -33,19 +42,28 @@ class MemoryTurn:
 
 
 class MemoryStore:
-    """SQLite-backed turn storage with strict session isolation and retention."""
+    """Turn storage with strict session isolation and retention.
+    Backend (SQLite or Postgres) is chosen once at construction; see module
+    docstring."""
 
     def __init__(
         self,
         path: str | Path | None = None,
         retention_days: int | None = None,
         enabled: bool | None = None,
+        dsn: str | None = None,
     ) -> None:
-        self.path = Path(path or config.MEMORY_DB_PATH)
         self.retention_days = retention_days if retention_days is not None else config.MEMORY_RETENTION_DAYS
         self.enabled = config.MEMORY_ENABLED if enabled is None else enabled
+        # An explicit `path` (every existing test passes one) always forces
+        # SQLite, regardless of NEON_DATABASE_URL being set in the
+        # environment -- tests must stay deterministic and isolated.
+        self.dsn = dsn or (db_postgres.dsn() if path is None else None)
+        self.backend = "postgres" if self.dsn else "sqlite"
+        self.path = Path(path or config.MEMORY_DB_PATH) if self.backend == "sqlite" else None
         if self.enabled:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self.backend == "sqlite":
+                self.path.parent.mkdir(parents=True, exist_ok=True)
             self._initialise()
 
     def _connect(self) -> sqlite3.Connection:
@@ -57,6 +75,9 @@ class MemoryStore:
         return conn
 
     def _initialise(self) -> None:
+        if self.backend == "postgres":
+            self._pg_initialise()
+            return
         with closing(self._connect()) as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute(
@@ -83,6 +104,33 @@ class MemoryStore:
                 )
                 """
             )
+
+    def _pg_initialise(self) -> None:
+        with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_turns (
+                    id BIGSERIAL PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    content_tsv TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
+                )
+                """
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_session_created "
+                "ON memory_turns(session_id, created_at DESC)"
+            )
+            # Postgres's built-in full-text search stands in for SQLite FTS5 --
+            # same "OR across regex-tokenised terms, ranked" semantics as
+            # relevant() below, GIN-indexed rather than a separate virtual table.
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_content_tsv "
+                "ON memory_turns USING GIN(content_tsv)"
+            )
+            conn.commit()
 
     @staticmethod
     def _validate_session(session_id: str) -> str:
@@ -114,6 +162,18 @@ class MemoryStore:
         if not content:
             return
         content = content[:config.MEMORY_MAX_CONTENT_CHARS]
+
+        if self.backend == "postgres":
+            cutoff = datetime.now(UTC) - timedelta(days=max(0, self.retention_days))
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM memory_turns WHERE created_at < %s", (cutoff,))
+                cur.execute(
+                    "INSERT INTO memory_turns(session_id, role, content, created_at) VALUES (%s, %s, %s, %s)",
+                    (session_id, role, content, datetime.now(UTC)),
+                )
+                conn.commit()
+            return
+
         now = datetime.now(UTC).isoformat()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -133,6 +193,20 @@ class MemoryStore:
             return []
         session_id = self._validate_session(session_id)
         limit = max(1, limit or config.MEMORY_MAX_TURNS)
+
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT role, content, created_at FROM memory_turns "
+                    "WHERE session_id = %s ORDER BY id DESC LIMIT %s",
+                    (session_id, limit),
+                )
+                rows = cur.fetchall()
+            return [
+                MemoryTurn(role=r["role"], content=r["content"], created_at=r["created_at"].isoformat())
+                for r in reversed(rows)
+            ]
+
         with closing(self._connect()) as conn:
             self._purge_expired(conn)
             rows = conn.execute(
@@ -150,6 +224,28 @@ class MemoryStore:
         terms = list(dict.fromkeys(_WORD_RE.findall((query or "").lower())))[:12]
         if not terms:
             return []
+
+        if self.backend == "postgres":
+            # Same OR-across-terms semantics as the SQLite FTS5 MATCH query below;
+            # terms are regex-tokenised alphanumerics only, safe to join directly.
+            tsquery = " | ".join(terms)
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT role, content, created_at
+                    FROM memory_turns
+                    WHERE content_tsv @@ to_tsquery('english', %s) AND session_id = %s
+                    ORDER BY ts_rank(content_tsv, to_tsquery('english', %s)) DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (tsquery, session_id, tsquery, max(1, limit)),
+                )
+                rows = cur.fetchall()
+            return [
+                MemoryTurn(role=r["role"], content=r["content"], created_at=r["created_at"].isoformat())
+                for r in rows
+            ]
+
         # FTS syntax is built only from regex-tokenised alphanumerics.
         match = " OR ".join(terms)
         with closing(self._connect()) as conn:
@@ -170,6 +266,13 @@ class MemoryStore:
         if not self.enabled:
             return
         session_id = self._validate_session(session_id)
+
+        if self.backend == "postgres":
+            with db_postgres.connect(self.dsn) as conn, conn.cursor() as cur:
+                cur.execute("DELETE FROM memory_turns WHERE session_id = %s", (session_id,))
+                conn.commit()
+            return
+
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
             ids = [r[0] for r in conn.execute("SELECT id FROM memory_turns WHERE session_id = ?", (session_id,))]

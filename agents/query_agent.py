@@ -81,10 +81,14 @@ def run(query: str, history: list[dict] | None = None) -> QueryAnalysis:
     turns = []
     for turn in history[-config.MAX_HISTORY_TURNS:]:
         turns.append(f"{turn.get('role', '')}: {str(turn.get('content', ''))[:350]}")
+    # Backslash-in-f-string-expression (PEP 701) needs Python 3.12+; this
+    # deployment's runtime is not guaranteed to be that new (e.g. Streamlit
+    # Community Cloud), so the join happens outside the f-string.
+    history_block = "\n".join(turns) or "None"
     raw = call_llm(
         messages=[
             {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": f"History:\n{'\n'.join(turns) or 'None'}\n\nQuestion: {query}"},
+            {"role": "user", "content": f"History:\n{history_block}\n\nQuestion: {query}"},
         ],
         model=config.FAST_LLM,
         temperature=config.DECOMPOSER_TEMP,
