@@ -500,7 +500,7 @@ def _check_groq() -> tuple[bool, str]:
         )
         resp.raise_for_status()
         available = {m["id"] for m in resp.json().get("data", [])}
-        missing = [m for m in (config.MAIN_LLM, config.FAST_LLM) if m not in available]
+        missing = [m for m in (config.MAIN_LLM, config.FAST_LLM, config.CRITIC_LLM) if m not in available]
         if missing:
             return False, f"Configured model(s) not on Groq's current roster: {missing}. See console.groq.com/docs/models"
         return True, "Groq OK"

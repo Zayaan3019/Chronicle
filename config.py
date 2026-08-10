@@ -46,7 +46,22 @@ if LLM_PROVIDER == "groq":
     # roster rotates -- if a model here 404s, check console.groq.com/docs/models
     # and update the default (or override via env var without a code change).
     _DEFAULT_MAIN_LLM = "qwen/qwen3.6-27b"    # reasoning agent; same family as the qwen3:8b this replaces
-    _DEFAULT_FAST_LLM = "llama-3.1-8b-instant"  # decomposer/critic; Groq's own low-latency model
+    _DEFAULT_FAST_LLM = "llama-3.1-8b-instant"  # decomposer; Groq's own low-latency model
+    # Deliberately a DIFFERENT model from FAST_LLM, not the same one -- Groq's
+    # rate limits are per-model, independent token/request pools (verified
+    # empirically 2026-08-10 by comparing live x-ratelimit-* response headers
+    # across models, which directly contradicted Groq's own rate-limits doc
+    # page summary claiming org-wide shared limits). query_agent (decomposer),
+    # critic_agent, and simple-query reasoning can all call FAST_LLM within
+    # seconds of one another for a single question -- a real deploy hit
+    # FAST_LLM's 6,000 TPM pool exactly this way ("Rate limit reached...
+    # Used 3141, Requested 3141"). Moving the critic to its own pool
+    # (llama-3.3-70b-versatile: 12,000 TPM, double FAST_LLM's) cuts peak
+    # same-pool pressure from 3 concurrent calls to 2 in the worst case, with
+    # no new provider or dependency. Verified this model produces clean,
+    # think-block-free JSON matching critic_agent's exact call shape
+    # (json_mode=True) before wiring it in here.
+    _DEFAULT_CRITIC_LLM = "llama-3.3-70b-versatile"
 else:
     # Primary reasoning model — qwen3:8b for Agent 2 (Reasoner).
     # qwen3:8b is a newer generation Qwen model with built-in thinking mode; its CoT output
@@ -56,9 +71,14 @@ else:
     # qwen2.5:3b is fast, reliable for JSON output, and sufficient for routing/verification.
     # Ollama's format=json automatically disables qwen3 thinking mode for JSON calls too.
     _DEFAULT_FAST_LLM = "qwen2.5:3b"
+    # Local Ollama has no per-model rate-limit pools to split load across --
+    # the CRITIC_LLM/FAST_LLM split exists specifically for Groq's per-model
+    # accounting, so the critic just uses the same local model here.
+    _DEFAULT_CRITIC_LLM = "qwen2.5:3b"
 
 MAIN_LLM = os.getenv("MAIN_LLM", _DEFAULT_MAIN_LLM)
 FAST_LLM = os.getenv("FAST_LLM", _DEFAULT_FAST_LLM)
+CRITIC_LLM = os.getenv("CRITIC_LLM", _DEFAULT_CRITIC_LLM)
 
 # ── Embeddings ────────────────────────────────────────────────────────
 # Always local via sentence-transformers, regardless of LLM_PROVIDER -- avoids

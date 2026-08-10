@@ -66,7 +66,7 @@ def run(question: str, chunks: list[ChunkResult], answer: str) -> CriticResult:
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": f"SOURCES:\n{_build_context(chunks)}\n\nQUESTION: {question}\n\nANSWER: {answer}"},
         ],
-        model=config.FAST_LLM,
+        model=config.CRITIC_LLM,
         temperature=config.CRITIC_TEMP,
         json_mode=True,
     )
