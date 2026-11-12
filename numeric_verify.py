@@ -117,6 +117,42 @@ def _values_match(a: NumericClaim, b: NumericClaim) -> bool:
     return abs(a.value - b.value) / denom <= TOLERANCE
 
 
+# SEC filings state a table's unit once, in its caption -- "(dollars in
+# millions)", "(in thousands, except per-share amounts)" -- and print bare
+# cell values. Table cells also reach the chunk text pipe-separated, which
+# splits "$ | 254,098" and "21 | %" away from their decoration.
+_DECLARED_UNIT_RE = re.compile(r"(?i)\bin\s+(millions|thousands|billions)\b")
+_UNIT_FACTOR = {"thousands": 1e3, "millions": 1e6, "billions": 1e9}
+
+
+def source_numbers(text: str) -> list[NumericClaim]:
+    """Numbers a source chunk supports, read the way a filing is written.
+
+    Only the source side is interpreted generously; answer claims are still
+    extracted strictly by `extract_numbers`. Two readings are added:
+    table cells are re-joined to their "$"/"%" decoration, and when the chunk
+    declares a unit ("in millions"), each undecorated non-percent figure also
+    counts at that scale -- so "$254,098 million" and "$254.1 billion" both
+    match a 10-K cell of "254,098" under "(dollars in millions)", while a
+    different figure still fails the TOLERANCE check.
+    """
+    joined = re.sub(r"([$€£])\s*\|\s*(?=\d)", r"\1", text)
+    joined = re.sub(r"(\d)\s*\|\s*(%)", r"\1\2", joined)
+    numbers = extract_numbers(joined)
+
+    factors = {_UNIT_FACTOR[u.lower()] for u in _DECLARED_UNIT_RE.findall(joined)}
+    if factors:
+        for m in _CLAIM_RE.finditer(joined):
+            if m.group("scale") or m.group("percent") or not m.group("number"):
+                continue
+            base = _parse_value(m.group("number"), None)
+            if base is None:
+                continue
+            for factor in factors:
+                numbers.append(NumericClaim(raw=m.group(0).strip(), value=base * factor, is_percent=False, span=m.span()))
+    return numbers
+
+
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z\[])")
 
 
@@ -146,7 +182,7 @@ def verify_numeric_claims(answer: str, chunks: list[ChunkResult]) -> NumericVeri
     def numbers_for(label: str) -> list[NumericClaim]:
         if label not in chunk_numbers_cache:
             chunk = chunk_by_label.get(label)
-            chunk_numbers_cache[label] = extract_numbers(chunk.text) if chunk else []
+            chunk_numbers_cache[label] = source_numbers(chunk.text) if chunk else []
         return chunk_numbers_cache[label]
 
     for sentence in _SENTENCE_SPLIT_RE.split(answer):

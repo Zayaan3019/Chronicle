@@ -101,3 +101,36 @@ def test_no_chunks_returns_empty_result():
     result = verify_numeric_claims("Revenue was $1.2B [Source nvda/abc123].", [])
     assert result.unsupported == []
     assert result.total_claims == 0
+
+
+# ── Filing tables: declared units and pipe-separated cells ───────────────────
+# The chunk below is the real shape of an Apple 10-K net-sales table as it
+# reaches the index (caption states the unit; cells are pipe-separated).
+
+_TEN_K_TABLE = (
+    "The following table shows net sales by category for 2026, 2025 and 2024 "
+    "(dollars in millions): [TABLE] 2026 | Change | 2025 | Change | 2024 "
+    "iPhone | $ | 254,098 | 21 | % | $ | 209,586 | 4 | % | $ | 201,183"
+)
+
+
+def test_declared_unit_and_table_cells_support_a_correct_answer():
+    answer = (
+        "iPhone net sales were $254,098 million in 2026, up 21% from $209,586 million "
+        "[Source nvda/t1]. That is about $254.1 billion [Source nvda/t1]."
+    )
+    result = verify_numeric_claims(answer, [_chunk("t1", _TEN_K_TABLE)])
+    assert result.unsupported == []
+    assert result.checked_against_chunks == 4
+
+
+def test_declared_unit_does_not_excuse_a_wrong_figure():
+    answer = "iPhone net sales were $264,098 million, up 31% [Source nvda/t1]."
+    result = verify_numeric_claims(answer, [_chunk("t1", _TEN_K_TABLE)])
+    assert sorted(result.unsupported) == ["$264,098 million", "31%"]
+
+
+def test_unscaled_figure_without_declared_unit_still_fails_at_scale():
+    answer = "Revenue was $254,098 million [Source nvda/t2]."
+    source = _chunk("t2", "Revenue | $ | 254,098 | 2025 | 209,586")  # no unit caption
+    assert verify_numeric_claims(answer, [source]).unsupported == ["$254,098 million"]
