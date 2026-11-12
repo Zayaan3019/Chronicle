@@ -5,6 +5,12 @@ evidence index only from SEC EDGAR filings and GDELT news for a configured
 company watchlist (`live_sources.json`) — no bundled static knowledge base,
 no LLM-discovered URLs.
 
+**Live:** https://52-6-3-88.sslip.io. It runs always-on on AWS EC2 behind
+Caddy (HTTPS), with the index over Apple, Microsoft and NVIDIA's latest
+10-K/10-Q/8-K filings, refreshed daily. Try: *"What did Apple report about
+iPhone net sales in its most recent 10-K?"* Deployment details:
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
 ```text
 session memory -> live-source refresh (EDGAR/GDELT) -> research planner
 -> hybrid retrieval (as_of hard-filtered) -> evidence synthesizer
