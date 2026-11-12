@@ -28,8 +28,6 @@ extra CI wiring needed for the deploy step itself.
    ```toml
    LLM_PROVIDER = "groq"
    GROQ_API_KEY = "gsk_..."
-   MAIN_LLM = "qwen/qwen3.6-27b"
-   FAST_LLM = "llama-3.1-8b-instant"
    NEON_DATABASE_URL = "postgresql://...neon.tech/neondb?sslmode=require"
    EDGAR_USER_AGENT = "Chronicle-Research/1.0 (your-real-contact@example.org)"
    ```
@@ -42,45 +40,35 @@ extra CI wiring needed for the deploy step itself.
 5. Deploy. First build installs `requirements.txt` (a few minutes — includes
    downloading the `sentence-transformers` embedding model and the
    cross-encoder reranker on first run, cached afterward).
-6. **Rebuild the retrieval index against the new embedding model before
-   relying on real answers** (see below) — this only needs to happen once,
-   not on every deploy, since the index lives in Neon/committed data, not on
-   Streamlit's ephemeral disk... except `live_chroma_db/` is NOT in Neon (see
-   "Known limitation" below) — see that section before assuming persistence
-   here.
+6. Nothing to run by hand after deploy: the first visit to a fresh
+   container populates the retrieval index from the live sources (see
+   below).
 
-## Known limitation: the vector index itself is not yet in Neon
+## Cold start: the vector index is rebuilt per container
 
-`live_chroma_db/` (ChromaDB's on-disk index) stayed local-disk in this pass —
-only the *relational* state (memory, guardrail log, live-source tracking)
-moved to Postgres, because Chroma's persistence layer doesn't speak
-Postgres natively (it would need `pgvector` and a retrieval-layer rewrite,
-out of scope for this pass). Practical effect: **every fresh Streamlit Cloud
-container starts with an empty vector index** and needs a reindex to
-answer anything. Two ways to handle this, pick one:
+`live_chroma_db/` (ChromaDB's on-disk index) is local disk. Only the
+*relational* state (memory, guardrail log, live-source tracking) lives in
+Neon Postgres, because Chroma's persistence layer doesn't speak Postgres
+(moving it would need `pgvector` and a retrieval-layer rewrite). So every
+fresh Streamlit Cloud container starts with an empty vector index.
 
-- **Manual, simplest**: after each deploy, open the app's sidebar and click
-  "Refresh all sources" once (wired to `LiveDataAgent.refresh_for_query(...,
-  force=True)` already) — repopulates `live_chroma_db/` for that running
-  container. Lost again on the next redeploy/container restart; repeat.
-- **Automatic**: add a one-time startup check in `app.py` that calls
-  `indexer.get_index_stats()` and triggers a refresh if `vector_chunks == 0`
-  — turns the manual step above into a self-healing cold start at the cost
-  of one real EDGAR/GDELT refresh cycle (a minute or two) the first time
-  anyone visits after a redeploy. Not implemented here — a reasonable
-  next increment, flagged rather than silently left for you to discover.
-
-This is the same class of trade-off already disclosed elsewhere in this
-plan (AI-Evals's demo-tenant key, HydroGraph's synthetic-elevation proxy):
-stated plainly rather than silently working around it, consistent with this
-codebase's existing disclosure style.
+`app.py`'s `_ensure_index_populated()` handles that. On startup it checks
+`indexer.get_index_stats()` and, if `vector_chunks == 0`, runs one forced
+refresh of the configured live sources (SEC EDGAR filings and GDELT news).
+It is wrapped in `@st.cache_resource`, so it runs once per container, not
+once per visitor. The first visitor after a redeploy waits a minute or two
+behind a spinner, and the sidebar lists what each source returned. Every
+chunk in the index comes from those live sources; nothing is bundled or
+generated. "Refresh all sources" in the sidebar forces another refresh at
+any time.
 
 ## Verifying a successful deploy
 
 1. Open the live URL. Sidebar should show `LLM (groq): ready` (not an
    Ollama-not-reachable error — confirms `check_ollama()`'s Groq branch, see
    `utils.py`, is wired correctly).
-2. Click "Refresh all sources" if the vector index is empty (see above).
+2. On the first visit, wait for the cold-start spinner to finish, then
+   check the sidebar's "Cold-start index population" lines for each source.
 3. Ask a real question, e.g. "What did Apple report about iPhone revenue in
    its most recent 10-K?" — should return a cited, grounded answer.
 4. Restart the app (Streamlit Cloud's "Reboot app") and confirm a prior

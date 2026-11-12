@@ -53,17 +53,23 @@ def _groq_retry_delay(resp: "requests.Response", attempt: int) -> float:
     return min(2.0 * (attempt + 1), 10.0)
 
 
-def _is_reasoning_model(model: str) -> bool:
+def _reasoning_off(model: str) -> str | None:
     """
-    Whether `model` accepts reasoning_effort="none" specifically (not just
-    "accepts the reasoning_effort parameter at all" -- verified empirically
-    2026-08-10 that gpt-oss models DO accept the parameter but reject "none",
-    only "low"/"medium"/"high", a different contract from qwen3's. Only
-    qwen3-family models are confirmed to accept "none"; extend this by
-    testing each new model added, not by assuming a shared contract across
-    Groq's reasoning models -- see console.groq.com/docs/models.
+    The reasoning_effort value that keeps a Groq reasoning model's output to
+    the answer itself, or None for a model that does not accept the field.
+
+    The contract differs by family (verified against Groq's API): qwen3
+    accepts "none" and then emits no <think> block; gpt-oss rejects "none"
+    and takes "low"/"medium"/"high", where "low" leaves enough of the token
+    budget for the answer. Plain models 400 if the field is sent at all.
+    Extend this by testing a new family, not by assuming a shared contract.
     """
-    return "qwen3" in model.lower()
+    name = model.lower()
+    if "qwen3" in name:
+        return "none"
+    if "gpt-oss" in name:
+        return "low"
+    return None
 
 
 def _ollama_options(temperature: float, num_ctx: int | None = None) -> dict:
@@ -193,8 +199,9 @@ def _call_groq(
     # empirically that Groq 400s ("reasoning_effort is not supported with this
     # model") when sent to a plain model like llama-3.1-8b-instant (FAST_LLM).
     # Same guard shape as the Ollama path's `"think": False` gate below it.
-    if not think and _is_reasoning_model(model):
-        payload["reasoning_effort"] = "none"
+    effort = None if think else _reasoning_off(model)
+    if effort is not None:
+        payload["reasoning_effort"] = effort
     # num_ctx / num_thread (Ollama server-tuning knobs) have no Groq equivalent
     # and are intentionally dropped rather than mapped to something misleading.
 
@@ -312,8 +319,9 @@ def _call_groq_stream(messages, model, temperature, think):
         "temperature": temperature,
         "stream": True,
     }
-    if not think and _is_reasoning_model(model):
-        payload["reasoning_effort"] = "none"
+    effort = None if think else _reasoning_off(model)
+    if effort is not None:
+        payload["reasoning_effort"] = effort
 
     # Retry-with-backoff on 429 happens BEFORE entering the streaming/yield
     # phase -- safe to retry the whole request here since no chunks have been

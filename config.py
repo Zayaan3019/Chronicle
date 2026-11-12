@@ -42,11 +42,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 
 if LLM_PROVIDER == "groq":
-    # Verified live against Groq's /v1/models on 2026-08-10. Groq's free-tier
+    # Verified live against Groq's /v1/models on 2026-11-12 (the 2026-08-10
+    # defaults, qwen3.6-27b / llama-3.1-8b-instant / llama-3.3-70b-versatile,
+    # had since been retired and returned 404). Groq's free-tier
     # roster rotates -- if a model here 404s, check console.groq.com/docs/models
     # and update the default (or override via env var without a code change).
-    _DEFAULT_MAIN_LLM = "qwen/qwen3.6-27b"    # reasoning agent; same family as the qwen3:8b this replaces
-    _DEFAULT_FAST_LLM = "llama-3.1-8b-instant"  # decomposer; Groq's own low-latency model
+    _DEFAULT_MAIN_LLM = "qwen/qwen3.8-27b"    # reasoning agent; same family as the qwen3:8b this replaces
+    _DEFAULT_FAST_LLM = "openai/gpt-oss-20b"  # decomposer; fastest model on the roster
     # Deliberately a DIFFERENT model from FAST_LLM, not the same one -- Groq's
     # rate limits are per-model, independent token/request pools (verified
     # empirically 2026-08-10 by comparing live x-ratelimit-* response headers
@@ -61,7 +63,7 @@ if LLM_PROVIDER == "groq":
     # no new provider or dependency. Verified this model produces clean,
     # think-block-free JSON matching critic_agent's exact call shape
     # (json_mode=True) before wiring it in here.
-    _DEFAULT_CRITIC_LLM = "llama-3.3-70b-versatile"
+    _DEFAULT_CRITIC_LLM = "openai/gpt-oss-120b"
 else:
     # Primary reasoning model — qwen3:8b for Agent 2 (Reasoner).
     # qwen3:8b is a newer generation Qwen model with built-in thinking mode; its CoT output

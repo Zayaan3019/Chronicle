@@ -6,7 +6,7 @@ LLM path (Ollama -> Groq swap, see utils.py) produces a real, grounded answer
 via the full agent pipeline -- a mocked LLM cannot catch a wrong Groq
 endpoint, an unsupported reasoning_effort value for a given model, or a
 response-shape mismatch, all of which are exactly the failure modes this
-swap introduced (see utils.py's _call_groq / _is_reasoning_model comments
+swap introduced (see utils.py's _call_groq / _reasoning_off comments
 for two such bugs already caught this way during development).
 
 Skipped unless GROQ_API_KEY is set, so contributors without a key (and any
@@ -70,8 +70,8 @@ def test_groq_json_mode_returns_parseable_json():
 def test_groq_reasoning_model_does_not_leak_think_block():
     """The specific bug this test suite exists to prevent regressing: a
     reasoning-capable Groq model (MAIN_LLM) emits inline <think> blocks
-    unless reasoning_effort="none" is sent -- verified empirically during
-    development (see utils.py's _call_groq docstring)."""
+    unless reasoning is switched off per family -- "none" for qwen3, "low"
+    for gpt-oss (see utils.py's _reasoning_off)."""
     import utils
 
     original_provider = config.LLM_PROVIDER
@@ -86,4 +86,5 @@ def test_groq_reasoning_model_does_not_leak_think_block():
         config.LLM_PROVIDER = original_provider
 
     assert "<think>" not in response
-    assert "4" in response
+    # "Answer in one word" legitimately yields either "4" or "Four".
+    assert "4" in response or "four" in response.lower()

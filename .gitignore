@@ -22,3 +22,5 @@ Together_assignment_writeup.pdf
 
 # Environment
 .env
+
+.venv/
