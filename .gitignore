@@ -24,3 +24,4 @@ Together_assignment_writeup.pdf
 .env
 
 .venv/
+.ssm-params.*

@@ -25,7 +25,7 @@ docker push -q "$REPO:$TAG" && docker push -q "$REPO:latest"
 
 echo "== deploy on $INSTANCE_ID"
 SCRIPT=$(base64 -w0 deploy/deploy-ec2.sh)
-PARAMS=$(mktemp)
+PARAMS=$(mktemp -p . .ssm-params.XXXXXX)  # in the CWD: a Windows aws.exe cannot read Git Bash /tmp
 python -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]], "executionTimeout": ["1800"]}))' \
   "echo $SCRIPT | base64 -d > /tmp/deploy-ec2.sh && IMAGE='$REPO:$TAG' bash /tmp/deploy-ec2.sh 2>&1" > "$PARAMS"
 CID=$(aws ssm send-command --region $REGION --instance-ids "$INSTANCE_ID" --document-name AWS-RunShellScript \
