@@ -86,6 +86,40 @@ def test_live_refresh_is_incremental_and_provenanced(tmp_path):
     assert bm25.calls[-1][0]  # old article chunks were replaced, not appended
 
 
+class ProbingVectorStore(FakeVectorStore):
+    """A local index that can say which chunks it holds, like VectorStore."""
+
+    def has_chunk_ids(self, ids):
+        held = {c.chunk_id for c in self.added} - set(self.deleted)
+        return bool(ids) and set(ids) <= held
+
+
+def test_fresh_index_is_refilled_even_when_durable_state_says_unchanged(tmp_path):
+    """Source tracking survives in shared storage (Neon in production) while
+    the vector index is per-container. A new container with an empty index
+    must re-embed documents the shared state already records -- otherwise it
+    reports 'Content hash unchanged' and serves an empty index forever."""
+    config_path = tmp_path / "sources.json"
+    _source_config(config_path)
+    html = "<html><body><main>" + "durable state live financial update " * 40 + "</main></body></html>"
+    kwargs = dict(
+        state_path=tmp_path / "state.sqlite3", sources_path=config_path,
+        embedder=lambda texts: [[float(i)] for i, _ in enumerate(texts)],
+        http_get=lambda *a, **k: FakeResponse(html), allow_insecure=True, allow_private=True,
+    )
+
+    first_container = ProbingVectorStore()
+    assert LiveDataAgent(first_container, FakeBM25(), **kwargs).refresh_for_query("x", force=True)[0].status == "updated"
+
+    same_container = LiveDataAgent(first_container, FakeBM25(), **kwargs)
+    assert same_container.refresh_for_query("x", force=True)[0].status == "unchanged"
+
+    new_container = ProbingVectorStore()  # empty local index, same durable state
+    report = LiveDataAgent(new_container, FakeBM25(), **kwargs).refresh_for_query("x", force=True)[0]
+    assert report.status == "updated"
+    assert new_container.added
+
+
 def test_live_citations_are_exposed_to_the_reasoner():
     chunk = ChunkResult(
         chunk_id="x", text="A live safety update was published.",

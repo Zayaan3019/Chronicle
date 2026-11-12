@@ -7,6 +7,7 @@
 # One-time prerequisites: the host exists (infra/projects/chronicle) and the
 # settings are in SSM Parameter Store (deploy/put_params.py).
 set -euo pipefail
+export PYTHONUTF8=1  # Windows aws.exe otherwise fails printing non-ASCII log output
 
 REGION=us-east-1
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)

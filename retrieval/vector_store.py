@@ -138,6 +138,13 @@ class VectorStore:
         if chunk_ids:
             self._col.delete(ids=chunk_ids)
 
+    def has_chunk_ids(self, chunk_ids: list[str]) -> bool:
+        """True when every supplied chunk is present in this local index."""
+        if not chunk_ids:
+            return False
+        found = self._col.get(ids=chunk_ids, include=[])
+        return len(found.get("ids", [])) == len(set(chunk_ids))
+
     def clear(self) -> None:
         self._client.delete_collection(self.COLLECTION_NAME)
         self._col = self._client.get_or_create_collection(

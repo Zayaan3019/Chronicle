@@ -689,6 +689,12 @@ class LiveDataAgent:
         finally:
             self._release_lease(source.id, lease_owner)
 
+    def _indexed_here(self, row) -> bool:
+        check = getattr(self.vector_store, "has_chunk_ids", None)
+        if check is None:  # stores without the probe (test doubles) keep the old behaviour
+            return True
+        return check(json.loads(row["chunk_ids_json"]))
+
     def _refresh_source_locked(self, source: LiveSource, force: bool = False) -> RefreshReport:
         """Refresh implementation; caller must hold the source lease."""
         if not self._is_due(source, force):
@@ -720,7 +726,11 @@ class LiveDataAgent:
                     f"{source.title}|{source.publisher}|{source.cluster}|{document['text']}"
                 )
                 row = self._lookup_live_document(source.id, document["item_key"])
-                if row and row["content_hash"] == digest:
+                # Source tracking is durable (Neon) but the vector index is
+                # local to each container, so a matching hash only proves this
+                # document was indexed *somewhere*. Skip it only when its chunks
+                # are in this index; a fresh container re-embeds it.
+                if row and row["content_hash"] == digest and self._indexed_here(row):
                     continue
                 article_id = row["article_id"] if row else self._article_id(source.id, document["item_key"])
                 old_chunk_ids = json.loads(row["chunk_ids_json"]) if row else []
