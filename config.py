@@ -109,8 +109,10 @@ EMBED_BATCH_SIZE = 20    # chunks per embed_batch call
 BASE_DIR           = os.path.dirname(os.path.abspath(__file__))
 # A new namespace ensures no legacy/static vectors or sparse artifacts can ever
 # be read by the live-only application.
-CHROMA_PERSIST_DIR = os.path.join(BASE_DIR, "live_chroma_db")
-BM25_INDEX_PATH    = os.path.join(BASE_DIR, "data", "live_bm25_index.pkl")
+# Overridable so a container can keep both indexes on a persistent volume
+# (the EC2 deployment mounts one at /state); defaults are unchanged locally.
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", os.path.join(BASE_DIR, "live_chroma_db"))
+BM25_INDEX_PATH    = os.getenv("BM25_INDEX_PATH", os.path.join(BASE_DIR, "data", "live_bm25_index.pkl"))
 
 # ── SEC EDGAR ──────────────────────────────────────────────────────────
 # SEC's fair-access policy (https://www.sec.gov/os/webmaster-faq#developers)

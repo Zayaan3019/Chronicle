@@ -1,9 +1,7 @@
-# Only relevant to the AWS EC2 fallback path (see infra/ and this repo's
-# deploy docs) -- Streamlit Community Cloud (the primary deployment target)
-# builds directly from git, not a Docker context, and never reads this file.
-# Demo.mp4/Together_assignment_writeup.pdf are already gitignored so they'd
-# never reach a `git clone`-based build either, but Docker does NOT respect
-# .gitignore for its build context, so they're excluded here explicitly too.
+# Build context for the EC2 image (Dockerfile, deploy/). Docker does not read
+# .gitignore, so everything that must never reach an image is listed here.
+.env
+.env.*
 .git
 .github
 .claude
@@ -12,10 +10,16 @@ venv
 __pycache__
 **/__pycache__
 .pytest_cache
+tests
 data/*.sqlite3
+data/*.pkl
+data/eval_run/
+bm25_index.pkl
 live_chroma_db/
 chroma_db/
 articles_cache/
+index_done.flag
+final_eval_results.json
 Demo.mp4
 Together_assignment_writeup.pdf
 *.md
