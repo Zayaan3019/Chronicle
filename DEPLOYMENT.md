@@ -1,8 +1,9 @@
 # Deploying Chronicle
 
 Chronicle runs as a Docker container on its own always-on EC2 host
-(`chronicle-host`, t3.small), behind a CloudFront distribution that gives it
-an HTTPS URL and carries Streamlit's WebSocket. The LLM is Groq's hosted API.
+(`chronicle-host`, t3.small). Caddy on the same host serves it over HTTPS with
+an automatically renewed Let's Encrypt certificate, at
+`https://<elastic-ip-with-dashes>.sslip.io`, and proxies Streamlit's WebSocket. The LLM is Groq's hosted API.
 Embeddings and reranking run locally in the container (`BAAI/bge-small-en-v1.5`
 and `cross-encoder/ms-marco-MiniLM-L-6-v2`, baked into the image). Durable
 relational state (conversation memory, the guardrail audit log, live-source
@@ -22,13 +23,14 @@ restarts and redeploys, and are filled at deploy time rather than by a visitor.
 | Piece | Where |
 |---|---|
 | Image | `Dockerfile` (CPU-only PyTorch, models baked in, non-root user) |
-| Host, CloudFront, IAM | `infra/projects/chronicle` (Terraform, uses `modules/ec2-docker-host`) |
+| Host, ports, IAM | `infra/projects/chronicle` (Terraform, uses `modules/ec2-docker-host`) |
 | Settings | SSM Parameter Store `/chronicle/*` (`GROQ_API_KEY`, `NEON_DATABASE_URL` as SecureString) |
 | Deploy | `deploy/publish-ec2.sh` (build, push to ECR, run `deploy/deploy-ec2.sh` on the host via SSM) |
 
-The host has no SSH and no open ports except 8501. That port accepts traffic
-only from CloudFront's origin-facing address ranges, so the instance cannot be
-reached directly.
+The host has no SSH. Only ports 80 (certificate challenge and redirect) and
+443 are open; Streamlit's 8501 is bound to loopback and the Docker network.
+CloudFront was the first choice, but this account is not yet verified for
+it (CreateDistribution returns 403 until AWS Support verifies the account).
 
 ## First deployment
 
@@ -36,7 +38,7 @@ reached directly.
 # 1. settings: copies ./.env into /chronicle/* (values are never printed)
 python deploy/put_params.py
 
-# 2. infrastructure (10 resources, nothing replaced)
+# 2. infrastructure: host, Elastic IP, security group, IAM
 cd ../infra/projects/chronicle && terraform init && terraform apply && cd -
 
 # 3. image + container (wait ~3 min after step 2 for the host to finish booting)
@@ -61,7 +63,7 @@ nothing is bundled or generated.
 
 ## Verifying a deployment
 
-1. Open the CloudFront URL. The sidebar should show `LLM (groq): ready`.
+1. Open the URL from `terraform output url`. The sidebar should show `LLM (groq): ready`.
 2. Ask a real question, e.g. "What did Apple report about iPhone revenue in its
    most recent 10-K?" It should return a cited, grounded answer.
 3. Restart the container with

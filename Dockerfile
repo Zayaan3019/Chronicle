@@ -39,10 +39,8 @@ EXPOSE 8501
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)"
 
-# CORS/XSRF checks are off because CloudFront fronts the app on a different
-# origin than the container sees; the app has no forms that act on a session
-# cookie, and nothing it serves is private.
+# Streamlit's CORS and XSRF protections stay on: Caddy preserves the Host
+# header, so the browser and the app agree on the origin.
 CMD ["streamlit", "run", "app.py", \
      "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", \
-     "--server.enableCORS=false", "--server.enableXsrfProtection=false", \
      "--browser.gatherUsageStats=false"]

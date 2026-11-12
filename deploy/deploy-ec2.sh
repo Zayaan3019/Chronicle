@@ -28,9 +28,12 @@ aws ecr get-login-password --region "$REGION" | docker login --username AWS --pa
 docker pull -q "$IMAGE"
 
 echo "== 3. (re)start the container; indexes persist in the chronicle_state volume"
+docker network inspect chronicle-net >/dev/null 2>&1 || docker network create chronicle-net >/dev/null
 docker rm -f chronicle >/dev/null 2>&1 || true
-docker run -d --name chronicle --restart unless-stopped \
-  -p 8501:8501 --env-file "$ENVF" -v chronicle_state:/state \
+# 8501 is published on loopback only (for the health check below); the
+# internet reaches the app through Caddy on 443.
+docker run -d --name chronicle --restart unless-stopped --network chronicle-net \
+  -p 127.0.0.1:8501:8501 --env-file "$ENVF" -v chronicle_state:/state \
   --memory 1700m --log-opt max-size=20m --log-opt max-file=3 \
   "$IMAGE" >/dev/null
 up=0
@@ -44,6 +47,46 @@ if [ "$up" != 1 ]; then
   exit 1
 fi
 echo "streamlit healthy"
+
+echo "== 3b. HTTPS: Caddy with an automatic Let's Encrypt certificate"
+# <a-b-c-d>.sslip.io resolves to the Elastic IP, so the hostname is stable for
+# the life of the EIP. Caddy renews the cert itself and proxies WebSockets.
+TOKEN=$(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)
+PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+SITE="${PUBLIC_IP//./-}.sslip.io"
+cat > /opt/chronicle/Caddyfile <<CADDY
+$SITE {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+	reverse_proxy chronicle:8501
+}
+CADDY
+if docker ps --format '{{.Names}}' | grep -qx caddy; then
+  docker exec caddy caddy reload --config /etc/caddy/Caddyfile >/dev/null
+else
+  docker rm -f caddy >/dev/null 2>&1 || true
+  docker run -d --name caddy --restart unless-stopped --network chronicle-net \
+    -p 80:80 -p 443:443 -v /opt/chronicle/Caddyfile:/etc/caddy/Caddyfile:ro \
+    -v caddy_data:/data -v caddy_config:/config \
+    --memory 128m --log-opt max-size=10m --log-opt max-file=3 \
+    caddy:2.8.4 >/dev/null
+fi
+cert=0
+for i in $(seq 1 40); do
+  if curl -fs -m 5 -o /dev/null "https://$SITE/_stcore/health"; then cert=1; break; fi
+  sleep 3
+done
+if [ "$cert" != 1 ]; then
+  echo "FATAL: https://$SITE did not answer with a valid certificate. Caddy log:"
+  docker logs --tail 30 caddy 2>&1
+  exit 1
+fi
+echo "https://$SITE serving with a valid certificate"
 
 echo "== 4. fill the index now, so no visitor waits for it"
 docker exec chronicle python -c '
