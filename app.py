@@ -50,6 +50,13 @@ def _ensure_index_populated() -> list[str]:
     return [f"{r.source_id}: {r.status} — {r.message}" for r in reports]
 
 
+def display_text(answer: str) -> str:
+    """Display-only cleanup of model output. Some models write citation
+    markers in CJK lenticular brackets (e.g. 【EVIDENCE 1】); show them as
+    plain brackets. The stored answer and the guardrail input are unchanged."""
+    return answer.replace("【", "[").replace("】", "]")
+
+
 def source_label(chunk) -> str:
     return chunk.citation_label if hasattr(chunk, "citation_label") else chunk.get("citation_label", "Source")
 
@@ -138,7 +145,7 @@ st.caption(
 
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+        st.markdown(display_text(message["content"]))
         details = message.get("details")
         if details:
             with st.expander("Evidence and agent trace", expanded=False):
@@ -178,7 +185,7 @@ if question:
                 on_step=on_step, as_of=as_of_param,
             )
             progress.update(label="Research complete", state="complete", expanded=False)
-            st.markdown(result.final_answer)
+            st.markdown(display_text(result.final_answer))
             st.caption(f"Completed in {time.time() - started:.1f}s" + (f" · as_of={as_of_param}" if as_of_param else ""))
             details = {
                 "route": result.route,
